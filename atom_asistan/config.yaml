@@ -1,0 +1,235 @@
+name: Atom Asistan Bridge
+version: "1.20.0"
+slug: atom_asistan
+description: AtomS3R sesli asistan koprusu - OpenAI Realtime + Home Assistant kontrolu
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: auto
+homeassistant_api: true
+# token_kullanim.csv Windows'tan gorulebilsin diye /share'e yaziliyor:
+#   \\HOMEASSISTANT\share\atom_asistan\token_kullanim.csv
+map:
+  - share:rw
+ports:
+  8765/tcp: 8765
+ports_description:
+  8765/tcp: AtomS3R WebSocket baglantisi
+options:
+  openai_api_key: ""
+  openai_model: gpt-realtime-2.1
+  voice: marin
+  # Oturumu acik tutmak BEDAVA (ses gonderilmedikce token yazmaz) ama
+  # OpenAI'nin prompt onbellegini canli tutar: onbellekli metin girisi
+  # 10 kat ucuz. Kisa tutmak her uyanista tam fiyat odemek demek.
+  session_idle_timeout: 180
+  vad_silence_ms: 700
+  vad_threshold_mult: 2.0
+  vad_min_speech_ms: 160
+  follow_up_window: 60
+  prebuffer_ms: 5000
+  min_utterance_ms: 400
+  max_turn_ms: 15000
+  pc_show_enabled: true
+  pc_mqtt_topic: "atom/ask"
+  pc_transport: atom_desk
+  pc_mode: browser
+  # Kendi yolunu yaz. pc_mode: komut secilmediyse kullanilmaz.
+  pc_command_prefix: "-NoProfile -ExecutionPolicy Bypass -File \"C:\\Users\\KULLANICI\\Documents\\Scripts\\ask-chatgpt.ps1\""
+  expose_domains:
+    - light
+    - switch
+    - fan
+    - cover
+    - climate
+    - media_player
+    - scene
+    - script
+    - sensor
+  max_entities: 80
+  name_filter: []
+  # Varliklara Turkce ad ver. DOLU ise modele SADECE bu liste verilir -
+  # 400 sensor arasindan dogru olani secmeye calismaz, cok daha isabetli olur.
+  # Bicim:  "entity_id = ad"   (ad icinde birkac soyleyisi / ile ayirabilirsin)
+  varlik_adlari: []
+  wake_word_enabled: true
+  wake_word_model: hey_jarvis
+  wake_word_threshold: 0.44
+  instructions: ""
+  log_level: info
+  # --- Kisisel hafiza -------------------------------------------------
+  # Buraya yazdiklarin her oturumda modele verilir. Kalici, sen duzenlersin.
+  # Asistanin kendi ogrendikleri ayrica /data/hafiza.json'a yazilir.
+  # Ornek (kendinkiyle degistir):
+  #   - "Kullanicinin adi Ali."
+  #   - "Konum sorulmadan hava durumu istenirse Istanbul varsayilir."
+  hafiza: []
+  hafiza_ogrenme: true
+  # --- Zamanlayici ----------------------------------------------------
+  zamanlayici_enabled: true
+  # --- HA'dan gelen bildirimler (MQTT) --------------------------------
+  notify_enabled: false
+  mqtt_host: core-mosquitto
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_pass: ""
+  notify_topic: "atom/say"
+  # --- Rahatsiz etme (toplanti modu) ----------------------------------
+  # Acikken wake word yok sayilir, bildirimler beklemeye alinir.
+  # Kapatmak icin: cihazin butonuna bas, ya da HA'dan atom/dnd'ye "off" yolla.
+  dnd_topic: "atom/dnd"
+  # Sure verilmeden acilirsa kac dakika sursun (0 = suresiz)
+  dnd_varsayilan_dk: 60
+  # DND sirasinda en fazla kac bildirim biriksin (0 = hic biriktirme)
+  dnd_kuyruk_max: 3
+  # PC klavye kisayolunun uyandirma icin yazdigi konu.
+  # Bos birakirsan uzaktan uyandirma kapanir.
+  wake_topic: "atom/wake"
+  # Easter egg: "hypno toad moduna gec" deyince spiral gozler
+  # bu kadar saniye ekranda kalir. 0 = kapali.
+  hypno_saniye: 60
+  # --- IMU jestleri (cihazdaki ivmeolcer) ------------------------------
+  # Cihazi masaya ters kapatinca rahatsiz etme acilir, kaldirinca kapanir.
+  # Cift tik (masaya iki kez vurmak) uyandirir - bu ayardan bagimsiz.
+  imu_ters_dnd: true
+  # --- Konusma gecmisi -------------------------------------------------
+  # Her tur /data/gecmis/<gun>.jsonl dosyasina yazilir; asistan
+  # "az once ne dedim", "bugun ne konustuk" sorularini cevaplayabilir.
+  gecmis_enabled: true
+  # Kac gun saklansin (0 = sinirsiz)
+  gecmis_gun_sayisi: 30
+  # --- Mutlak saatli hatirlaticilar -----------------------------------
+  # "yarin 9'da", "her sabah 8'de". Geri sayim zamanlayicisindan ayri.
+  hatirlatici_enabled: true
+  # Kopru kapaliyken gecen hatirlatici bu kadar gecikmeye kadar yine calar.
+  hatirlatici_gecikme_dk: 30
+  # --- Ortam modu (saat + hava durumu ekrani) -------------------------
+  # Uykuda 5 dakika gecince cihaz yuz yerine saat ekranini gosterir.
+  # false = ekranin TAMAMI kapali, cihaz uykuda yuzunde kalir.
+  ortam_enabled: true
+  # Hava durumunu tamamen kapatir: kartta YALNIZ saat gorunur, ortalanmis.
+  # ortam_enabled'dan farki: o saat ekranini da kapatip yuze dondurur.
+  ortam_hava_goster: true
+  # HA'daki weather varligi. Ornek: weather.forecast_home
+  ortam_hava_varlik: "weather.home_open_meteo"
+  # Sicaklik icin ayri bir sensor kullanmak istersen (bos = weather'inki).
+  ortam_sicaklik_varlik: ""
+  # Cihaza kac saniyede bir saat/hava gonderilsin. Cihaz aradaki
+  # dakikalari kendi sayiyor, sik gondermenin faydasi yok.
+  ortam_periyot_sn: 120
+  # --- Yuz renkleri ---------------------------------------------------
+  # Gozlerin rengi. Bicim: #RRGGBB. Bos = cihazdaki varsayilan (#5EE8E0).
+  # Sonuk ve uykulu tonlar bu renkten kendiliginden turetiliyor.
+  yuz_goz_renk: "#5EE8E0"
+  # Agiz rengi. Bos birakirsan gozle ayni renk kullanilir.
+  yuz_agiz_renk: ""
+  # --- Dans ------------------------------------------------------------
+  # Odada muzik calarken cihaz tempoyu bulup sallanir. Algilama cihazda
+  # yapilir; ne OpenAI'ye ne HA'ya bir sey gitmez. Yalniz cihaz BOSTAYKEN
+  # (uyku / saat ekrani / idle) devreye girer.
+  dans_enabled: true
+  # Muzik algilanmiyorsa bunu ac: cihaz her 0,5 saniyede olculen ham
+  # degerleri yolluyor ve log hangi kosulun tutmadigini yaziyor.
+  # Isin bitince KAPAT - saniyede 2 satir uretiyor.
+  dans_teshis: false
+  # Dansi ne tetiklesin?
+  #   medya    = HA'da bir media_player "playing" ise dans (ONERILEN).
+  #              Mikrofon yalnizca tempoyu bulmak icin kullanilir;
+  #              bulamazsa asagidaki varsayilan tempoya duser.
+  #   mikrofon = cihaz sesi dinleyip kendi karar verir.
+  # --- Eslik modu ------------------------------------------------------
+  # Takip suresi dolunca cihaz hemen uyumasin: bu kadar dakika uyanik ama
+  # sakin dursun. Dinleme kurallari DEGISMIYOR - mikrofon yine birakiliyor,
+  # wake word yine bekleniyor; degisen yalnizca ekran. Cihaz bu modda
+  # belirgin bir ses duyunca kisa bir sure o tarafa bakiyor.
+  # "Uyu" dersen sureyi beklemeden uyur. 0 = kapali (hemen uyku).
+  eslik_dakika: 30
+  dans_kaynak: medya
+  # Hangi oynaticilar sayilsin? Bos = HA'daki TUM media_player varliklari.
+  # Ornek: ["media_player.spotify", "media_player.salon"]
+  dans_medya_varliklar: []
+  # Mikrofon tempoyu bulamazsa bu tempoda sallanir.
+  dans_varsayilan_bpm: 120
+
+  # --- Atom Desk (Windows) surum bildirimi ---------------------------
+  # Kopru GitHub'daki son Atom Desk surumune bakip MQTT'ye retained
+  # yaziyor; PC uygulamasi o mesaji gorunce kendini guncelliyor. Kopru
+  # guncellemeyi kendi YAPMIYOR, yalnizca haber veriyor.
+  # MQTT (notify_enabled) kapaliysa bu ozellik de calismaz.
+  desk_guncelleme_enabled: true
+  desk_depo: Arda-Apps/atom-asistan-addon
+  desk_dal: main
+  # Surum isaretinin depo icindeki yolu.
+  desk_surum_yolu: atom_desk_surum.py
+  # Kac saatte bir bakilsin. Surum dosyasi birkac yuz bayt, maliyeti yok.
+  desk_kontrol_saat: 6
+schema:
+  openai_api_key: str
+  openai_model: str
+  voice: list(alloy|ash|ballad|coral|echo|sage|shimmer|verse|marin|cedar)
+  session_idle_timeout: int(5,600)
+  vad_silence_ms: int(200,3000)
+  vad_threshold_mult: float
+  vad_min_speech_ms: int(40,1000)
+  follow_up_window: float
+  prebuffer_ms: int(500,15000)
+  min_utterance_ms: int(0,3000)
+  max_turn_ms: int(2000,60000)
+  pc_show_enabled: bool
+  pc_mqtt_topic: str?
+  pc_transport: list(atom_desk|hassagent)
+  pc_mode: list(browser|app)
+  pc_command_prefix: str?
+  expose_domains:
+    - str
+  max_entities: int(1,300)
+  name_filter:
+    - str
+  varlik_adlari:
+    - str
+  wake_word_enabled: bool
+  wake_word_model: list(hey_jarvis|alexa|hey_mycroft|ok_nabu)
+  wake_word_threshold: float
+  instructions: str?
+  log_level: list(debug|info|warning|error)
+  hafiza:
+    - str
+  hafiza_ogrenme: bool
+  zamanlayici_enabled: bool
+  notify_enabled: bool
+  mqtt_host: str?
+  mqtt_port: int(1,65535)
+  mqtt_user: str?
+  mqtt_pass: password?
+  notify_topic: str?
+  dnd_topic: str?
+  dnd_varsayilan_dk: int(0,1440)
+  dnd_kuyruk_max: int(0,20)
+  wake_topic: str?
+  hypno_saniye: int(0,600)
+  imu_ters_dnd: bool
+  gecmis_enabled: bool
+  gecmis_gun_sayisi: int(0,365)
+  hatirlatici_enabled: bool
+  hatirlatici_gecikme_dk: int(1,1440)
+  ortam_enabled: bool
+  ortam_hava_goster: bool
+  ortam_hava_varlik: str?
+  ortam_sicaklik_varlik: str?
+  ortam_periyot_sn: int(30,900)
+  yuz_goz_renk: str?
+  yuz_agiz_renk: str?
+  dans_enabled: bool
+  dans_teshis: bool
+  eslik_dakika: int(0,240)
+  dans_kaynak: list(medya|mikrofon)
+  dans_medya_varliklar:
+    - str
+  dans_varsayilan_bpm: int(40,220)
+  desk_guncelleme_enabled: bool
+  desk_depo: str
+  desk_dal: str
+  desk_surum_yolu: str
+  desk_kontrol_saat: int(1,168)
