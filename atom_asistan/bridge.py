@@ -18,6 +18,7 @@ import json
 import re
 import logging
 import os
+import shutil
 import sys
 import time
 from typing import Optional
@@ -28,7 +29,7 @@ import websockets
 from aiohttp import ClientSession, ClientTimeout
 
 LOG = logging.getLogger("atom")
-BRIDGE_VERSION = "1.20.1"
+BRIDGE_VERSION = "1.20.2"
 
 # Koprunun kullandigi ekran ozellikleri icin gereken EN DUSUK firmware.
 # Kopru firmware'den daha sik guncelleniyor; surumlerin birebir esit olmasi
@@ -370,6 +371,115 @@ Yuz ifadesi:
 
 
 # ---------------------------------------------------------------- ayarlar
+# ===================== KURULUMLAR ARASI DURUM TASIMA =====================
+#
+# NEDEN VAR: Her add-on'un /data klasoru kendine ozel; baska bir add-on
+# onu goremiyor. Yerel olarak kurulmus kopru ile magazadan kurulan kopru
+# Supervisor icin IKI AYRI add-on (farkli slug). Yenisine gecildiginde
+# /data'daki her sey - modelin ogrendigi hafiza, hatirlaticilar,
+# zamanlayicilar, konusma gecmisi - geride kaliyordu.
+#
+# /share ise tum add-on'larin ortak gordugu tek yer. Kopru durumunu
+# periyodik olarak oraya yedekliyor; bos /data ile acilan yeni bir
+# kurulum ilk acilista oradan aliyor.
+#
+# AYARLAR (options.json) BILEREK TASINMIYOR: icinde OpenAI anahtari ve
+# MQTT sifresi var, /share ise Samba ile agdan erisilebilir. Ayarlar
+# elle kopyalaniyor.
+
+DURUM_DOSYALARI = ("hafiza.json", "zamanlayici.json", "hatirlatici.json",
+                   "maliyet_gunluk.json")
+DURUM_KLASORLERI = ("gecmis",)
+DURUM_PAYLASIM = "/share/atom_asistan/durum"
+DURUM_ISARET = ".durum_tasindi"
+
+
+def _durum_var_mi(state_dir: str) -> bool:
+    """state_dir'de tasinmaya deger bir sey var mi?"""
+    for ad in DURUM_DOSYALARI:
+        if os.path.isfile(os.path.join(state_dir, ad)):
+            return True
+    for ad in DURUM_KLASORLERI:
+        yol = os.path.join(state_dir, ad)
+        if os.path.isdir(yol) and os.listdir(yol):
+            return True
+    return False
+
+
+def durum_iceri_al(state_dir: str, paylasim: str = DURUM_PAYLASIM) -> list:
+    """/data BOSSA ve paylasimda bir yedek varsa onu iceri alir.
+
+    Dolu bir /data'ya ASLA dokunmaz - bu fonksiyonun tek isi yeni bir
+    kurulumu doldurmak, calisan birinin ustune yazmak degil.
+    Tasinan dosya/klasor adlarini doner (bos liste = bir sey yapilmadi).
+    """
+    if _durum_var_mi(state_dir):
+        return []
+    if os.path.exists(os.path.join(state_dir, DURUM_ISARET)):
+        return []            # daha once tasindi; sonradan bosaldiysa bilerek
+    kaynak = os.path.join(paylasim, "kaynak.json")
+    if not os.path.isfile(kaynak):
+        return []
+    os.makedirs(state_dir, exist_ok=True)
+    alinan = []
+    for ad in DURUM_DOSYALARI:
+        k = os.path.join(paylasim, ad)
+        if os.path.isfile(k):
+            shutil.copy2(k, os.path.join(state_dir, ad))
+            alinan.append(ad)
+    for ad in DURUM_KLASORLERI:
+        k = os.path.join(paylasim, ad)
+        if os.path.isdir(k):
+            shutil.copytree(k, os.path.join(state_dir, ad), dirs_exist_ok=True)
+            alinan.append(ad + "/")
+    try:
+        with open(kaynak, encoding="utf-8") as f:
+            bilgi = f.read()
+    except OSError:
+        bilgi = ""
+    with open(os.path.join(state_dir, DURUM_ISARET), "w", encoding="utf-8") as f:
+        f.write(bilgi)
+    return alinan
+
+
+def durum_disari_aktar(state_dir: str, surum: str,
+                       paylasim: str = DURUM_PAYLASIM) -> bool:
+    """state_dir'deki durumu paylasima yedekler.
+
+    BOS bir /data'yi ASLA aktarmaz: yeni ve bos bir kurulum, eskisinin
+    iyi yedeginin ustune bos yazmasin. Yazma once gecici bir klasore
+    yapiliyor, sonra degistiriliyor - yarida kesilirse eski yedek saglam
+    kalir.
+    """
+    if not _durum_var_mi(state_dir):
+        return False
+    ust = os.path.dirname(paylasim.rstrip("/")) or "/"
+    os.makedirs(ust, exist_ok=True)
+    yeni, eski = paylasim + ".yeni", paylasim + ".eski"
+    for d in (yeni, eski):
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+    os.makedirs(yeni)
+    for ad in DURUM_DOSYALARI:
+        k = os.path.join(state_dir, ad)
+        if os.path.isfile(k):
+            shutil.copy2(k, os.path.join(yeni, ad))
+    for ad in DURUM_KLASORLERI:
+        k = os.path.join(state_dir, ad)
+        if os.path.isdir(k):
+            shutil.copytree(k, os.path.join(yeni, ad))
+    with open(os.path.join(yeni, "kaynak.json"), "w", encoding="utf-8") as f:
+        json.dump({"kopru_surumu": surum,
+                   "kurulum": os.environ.get("HOSTNAME", ""),
+                   "zaman": time.strftime("%Y-%m-%dT%H:%M:%S")}, f)
+    if os.path.isdir(paylasim):
+        os.rename(paylasim, eski)
+    os.rename(yeni, paylasim)
+    if os.path.isdir(eski):
+        shutil.rmtree(eski, ignore_errors=True)
+    return True
+
+
 def load_config() -> dict:
     """Add-on ise /data/options.json, degilse komut satirindaki YAML."""
     opt_path = "/data/options.json"
@@ -1020,6 +1130,17 @@ class Bridge:
         # add-on ayarlarindan duzenlenir) + modelin hatirla ile ekledikleri
         # (/data altinda, yeniden kurulumda silinmez).
         self.state_dir = cfg.get("state_dir", "/data")
+        # Yuklemelerden ONCE: bos bir kurulumsa onceki kurulumun yedegini al.
+        # Hafiza, zamanlayici ve hatirlaticilar asagida okunuyor; sonra
+        # alinsaydi bu calismada gorunmezlerdi.
+        self._durum_paylasim = cfg.get("durum_paylasim", DURUM_PAYLASIM)
+        try:
+            tasinan = durum_iceri_al(self.state_dir, self._durum_paylasim)
+            if tasinan:
+                LOG.info("Onceki kurulumdan durum tasindi: %s", ", ".join(tasinan))
+        except Exception as e:
+            # Tasima basarisiz olursa kopru yine de acilsin; bos baslar.
+            LOG.warning("Durum tasinamadi, bos baslaniyor: %s", e)
         self.hafiza_sabit = [str(x).strip() for x in (cfg.get("hafiza") or []) if str(x).strip()]
         self.hafiza_ogrenme = bool(cfg.get("hafiza_ogrenme", True))
         self.hafiza_path = os.path.join(self.state_dir, "hafiza.json")
@@ -3721,6 +3842,19 @@ class Bridge:
                     LOG.debug("MQTT hazir degil, Atom Desk surumu sonra yazilacak")
             await asyncio.sleep(max(1, self.desk_kontrol_saat) * 3600)
 
+    async def durum_yedek_watchdog(self, dakika: float = 15.0):
+        """/data'yi periyodik olarak /share'e yedekler. Ilk yedek hemen."""
+        while True:
+            try:
+                if await asyncio.to_thread(durum_disari_aktar, self.state_dir,
+                                           BRIDGE_VERSION, self._durum_paylasim):
+                    LOG.debug("Durum /share'e yedeklendi")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                LOG.warning("Durum yedeklenemedi: %s", e)
+            await asyncio.sleep(dakika * 60)
+
     async def run(self):
         # Ilk deneme burada: hizli yolda katalog hazir olsun. Eksik kalirsa
         # arka planda tamamlanmaya devam eder, cihaz beklemek zorunda kalmaz.
@@ -3740,6 +3874,7 @@ class Bridge:
         asyncio.create_task(self.ortam_watchdog())
         asyncio.create_task(self.dans_watchdog())
         asyncio.create_task(self.desk_surum_watchdog())
+        asyncio.create_task(self.durum_yedek_watchdog())
         if self.gecmis_on:
             self.gecmis_temizle()
             LOG.info("Konusma gecmisi: acik (%d gun saklaniyor)", self.gecmis_gun)

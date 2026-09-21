@@ -1,5 +1,5 @@
 name: Atom Asistan Bridge
-version: "1.20.1"
+version: "1.20.2"
 slug: atom_asistan
 description: AtomS3R sesli asistan koprusu - OpenAI Realtime + Home Assistant kontrolu
 arch:
@@ -228,8 +228,11 @@ schema:
   dans_medya_varliklar:
     - str
   dans_varsayilan_bpm: int(40,220)
-  desk_guncelleme_enabled: bool
-  desk_depo: str
-  desk_dal: str
-  desk_surum_yolu: str
-  desk_kontrol_saat: int(1,168)
+  # "?" = istege bagli. Eski bir kurulumdan kopyalanan ayarlarda bu
+  # anahtarlar yok; zorunlu olsalar HA yapistirilan YAML'i reddederdi.
+  # Kopru hepsi icin varsayilan kullaniyor.
+  desk_guncelleme_enabled: bool?
+  desk_depo: str?
+  desk_dal: str?
+  desk_surum_yolu: str?
+  desk_kontrol_saat: int(1,168)?
