@@ -28,7 +28,7 @@ import websockets
 from aiohttp import ClientSession, ClientTimeout
 
 LOG = logging.getLogger("atom")
-BRIDGE_VERSION = "1.20.0"
+BRIDGE_VERSION = "1.20.1"
 
 # Koprunun kullandigi ekran ozellikleri icin gereken EN DUSUK firmware.
 # Kopru firmware'den daha sik guncelleniyor; surumlerin birebir esit olmasi
@@ -535,6 +535,7 @@ class HomeAssistant:
                                 "(elimizdeki %d) - katalog degistirilmedi",
                                 len(rows), len(self.adlar), self.katalog_sayi)
                 return len(rows)
+            onceki = self.katalog_sayi
             self.entity_catalog = "\n".join(rows)
             self.katalog_sayi = len(rows)
             self.katalog_tam = tam
@@ -543,7 +544,11 @@ class HomeAssistant:
                 LOG.warning("varlik_adlari'nda HA'da bulunmayan %d varlik var "
                             "(yazim hatasi olabilir): %s", len(eksik),
                             ", ".join(eksik[:8]) + ("..." if len(eksik) > 8 else ""))
-            if not sessiz or tam:
+            # Periyodik yenilemede (sessiz) yalnizca SAYI DEGISINCE yaz.
+            # Eskiden kosul "not sessiz or tam" idi - yani tam olarak her
+            # sey yolundayken, 15 dakikada bir ayni satiri basiyordu ve
+            # gercek hatalar bu satirlarin arasinda kayboluyordu.
+            if not sessiz or len(rows) != onceki or not tam:
                 LOG.info("HA katalogu: %d/%d varlik (varlik_adlari listesinden)%s",
                          len(rows), len(self.adlar),
                          "" if tam else "  - EKSIK, tekrar denenecek")
@@ -566,10 +571,11 @@ class HomeAssistant:
                 LOG.warning("HA su an sadece %d varlik donduruyor (elimizdeki %d)"
                             " - katalog degistirilmedi", len(rows), self.katalog_sayi)
             return len(rows)
+        onceki = self.katalog_sayi
         self.entity_catalog = "\n".join(rows)
         self.katalog_sayi = len(rows)
         self.katalog_tam = len(rows) > 0
-        if not sessiz or self.katalog_tam:
+        if not sessiz or len(rows) != onceki:
             LOG.info("HA katalogu: %d varlik", len(rows))
         return len(rows)
 
@@ -1364,9 +1370,34 @@ class Bridge:
             asyncio.create_task(self.dnd_ayarla(
                 acik, 0 if acik else None, kaynak="ters cevirme"))
 
+    # ------------------------------------------- thread-guvenli gorev baslat
+    def _gorev(self, coro):
+        """Coroutine'i asyncio dongusunde baslatir - HANGI THREAD'den
+        cagrildigi fark etmez.
+
+        NEDEN VAR: dnd_aktif() / hypno_aktif() sorgu fonksiyonlari ama
+        sure dolmussa yan etki olarak bir coroutine baslatiyorlar. Eskiden
+        bunu asyncio.create_task ile yapiyorlardi; create_task yalnizca
+        dongunun KENDI thread'inden calisir. DND kisayolu ("toggle")
+        dnd_aktif()'i paho'nun MQTT thread'inden cagirdi, create_task
+        "no running event loop" firlatti ve bu istisna paho thread'ini
+        oldurdu: kopru yeniden baslayana kadar MQTT tamamen durdu.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Dongu disindayiz (paho thread'i ya da baska bir thread).
+            if self._loop is None or self._loop.is_closed():
+                coro.close()             # "never awaited" uyarisi cikmasin
+                LOG.warning("Dongu hazir degil, gorev atlandi: %s",
+                            getattr(coro, "__qualname__", coro))
+                return None
+            return asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return asyncio.create_task(coro)
+
     # ------------------------------------------------- rahatsiz etme (DND)
     def dnd_aktif(self) -> bool:
-        """Suresi dolduysa kendiliginden kapanir."""
+        """Suresi dolduysa kendiliginden kapanir. Her thread'den cagrilabilir."""
         if self.dnd_bitis == 0:
             return False
         if self.dnd_bitis < 0:
@@ -1374,7 +1405,7 @@ class Bridge:
         if time.time() >= self.dnd_bitis:
             self.dnd_bitis = 0.0
             LOG.info("Rahatsiz etme suresi doldu - dinleme geri acildi")
-            asyncio.create_task(self._dnd_bitti())
+            self._gorev(self._dnd_bitti())
             return False
         return True
 
@@ -1428,11 +1459,13 @@ class Bridge:
 
     # ------------------------------------------------ hipnoz modu (easter egg)
     def hypno_aktif(self) -> bool:
+        """dnd_aktif ile ayni desen - ayni hata burada da vardi, henuz
+        tetiklenmemisti. Her thread'den cagrilabilir."""
         if self.hypno_bitis == 0:
             return False
         if time.time() >= self.hypno_bitis:
             self.hypno_bitis = 0.0
-            asyncio.create_task(self._hypno_bitti())
+            self._gorev(self._hypno_bitti())
             return False
         return True
 
@@ -2512,6 +2545,69 @@ class Bridge:
         return {"ok": True}
 
     # ------------------------------------------------- HA bildirimleri
+    def _mqtt_mesaj(self, konu: str, ham: str):
+        """Tek bir MQTT mesajini isler. paho thread'inde calisir; asyncio
+        islerini run_coroutine_threadsafe ile donguye atar. Istisna
+        firlatabilir - cagiran on_message hepsini yakaliyor."""
+        if self.wake_konu and konu == self.wake_konu:
+            # Yuk onemsiz: mesajin gelmesi "Hey Jarvis" demekle ayni.
+            LOG.info("Uzaktan uyandirma istegi (%s)", self.wake_konu)
+            if self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.uzaktan_uyandir("kisayol"), self._loop)
+            return
+
+        # Rahatsiz etme konusu: "on"/"off"/"30" ya da {"acik":true,"dakika":30}
+        if konu == self.dnd_konu:
+            acik, dakika = None, None
+            d = ham.lower()
+            if d.startswith("{"):
+                try:
+                    j = json.loads(ham)
+                    acik = bool(j.get("acik", j.get("on", True)))
+                    dakika = j.get("dakika", j.get("minutes"))
+                except json.JSONDecodeError:
+                    LOG.warning("DND mesaji bozuk JSON: %s", ham[:80])
+                    return
+            elif d in ("on", "ac", "aç", "true", "1", "acik", "açık"):
+                acik = True
+            elif d in ("off", "kapat", "false", "0", "kapali", "kapalı"):
+                acik = False
+            elif d in ("toggle", "cevir", "çevir", "degistir", "değiştir"):
+                # Klavye kisayolu / tek dugme icin: gonderen tarafin
+                # mevcut durumu bilmesi gerekmiyor.
+                acik = not self.dnd_aktif()
+            else:
+                try:
+                    dakika, acik = int(float(d)), True
+                except ValueError:
+                    LOG.warning("DND mesaji anlasilmadi: %s", ham[:80])
+                    return
+            if self._loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.dnd_ayarla(acik, dakika, kaynak="HA"), self._loop)
+            return
+
+        talimat, kaynak = ham, "HA"
+        if ham.startswith("{"):
+            try:
+                d = json.loads(ham)
+                talimat = str(d.get("prompt") or d.get("text") or "").strip()
+                kaynak = str(d.get("kaynak") or d.get("source") or "HA")
+            except json.JSONDecodeError:
+                pass
+        if not talimat:
+            LOG.warning("MQTT bildirimi bos, atlandi")
+            return
+        if self._loop is None:
+            LOG.warning("Bildirim geldi ama dongu hazir degil, atlandi")
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.proaktif_konus(talimat, kaynak=kaynak), self._loop)
+        except Exception as e:
+            LOG.warning("Bildirim isleme aktarilamadi: %s", e)
+
     def mqtt_baslat(self):
         """HA otomasyonlarindan gelen konusma isteklerini dinler.
         paho senkron calisir; kendi thread'inde donup coroutine'leri
@@ -2560,74 +2656,18 @@ class Bridge:
                           "kabul ediyor.", kod, rc)
 
         def on_message(c, userdata, msg):
-            # Buradaki her istisna paho thread'ini oldurur ve bildirimler
-            # sessizce durur - o yuzden govdenin tamami korumali.
+            # Buradaki HER istisna paho thread'ini oldurur: MQTT sessizce
+            # durur ve kopru yeniden baslayana kadar geri gelmez. Eskiden
+            # bu yorum vardi ama try yalnizca ilk satiri sariyordu; DND
+            # kisayolundaki bir hata tam da bu yuzden MQTT'yi oldurdu.
+            # Artik govdenin TAMAMI korumali; is mantigi _mqtt_mesaj'da.
             try:
                 ham = msg.payload.decode("utf-8", "replace").strip()
-            except Exception as e:
-                LOG.warning("MQTT mesaji okunamadi: %s", e)
-                return
-            if not ham:
-                return
-
-            # Rahatsiz etme konusu: "on"/"off"/"30" ya da {"acik":true,"dakika":30}
-            if self.wake_konu and msg.topic == self.wake_konu:
-                # Yuk onemsiz: mesajin gelmesi "Hey Jarvis" demekle ayni.
-                LOG.info("Uzaktan uyandirma istegi (%s)", self.wake_konu)
-                if self._loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self.uzaktan_uyandir("kisayol"), self._loop)
-                return
-
-            if msg.topic == self.dnd_konu:
-                acik, dakika = None, None
-                d = ham.lower()
-                if d.startswith("{"):
-                    try:
-                        j = json.loads(ham)
-                        acik = bool(j.get("acik", j.get("on", True)))
-                        dakika = j.get("dakika", j.get("minutes"))
-                    except json.JSONDecodeError:
-                        LOG.warning("DND mesaji bozuk JSON: %s", ham[:80])
-                        return
-                elif d in ("on", "ac", "aç", "true", "1", "acik", "açık"):
-                    acik = True
-                elif d in ("off", "kapat", "false", "0", "kapali", "kapalı"):
-                    acik = False
-                elif d in ("toggle", "cevir", "çevir", "degistir", "değiştir"):
-                    # Klavye kisayolu / tek dugme icin: gonderen tarafin
-                    # mevcut durumu bilmesi gerekmiyor.
-                    acik = not self.dnd_aktif()
-                else:
-                    try:
-                        dakika, acik = int(float(d)), True
-                    except ValueError:
-                        LOG.warning("DND mesaji anlasilmadi: %s", ham[:80])
-                        return
-                if self._loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self.dnd_ayarla(acik, dakika, kaynak="HA"), self._loop)
-                return
-
-            talimat, kaynak = ham, "HA"
-            if ham.startswith("{"):
-                try:
-                    d = json.loads(ham)
-                    talimat = str(d.get("prompt") or d.get("text") or "").strip()
-                    kaynak = str(d.get("kaynak") or d.get("source") or "HA")
-                except json.JSONDecodeError:
-                    pass
-            if not talimat:
-                LOG.warning("MQTT bildirimi bos, atlandi")
-                return
-            if self._loop is None:
-                LOG.warning("Bildirim geldi ama dongu hazir degil, atlandi")
-                return
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self.proaktif_konus(talimat, kaynak=kaynak), self._loop)
-            except Exception as e:
-                LOG.warning("Bildirim isleme aktarilamadi: %s", e)
+                if ham:
+                    self._mqtt_mesaj(msg.topic, ham)
+            except Exception:
+                LOG.exception("MQTT mesaji islenemedi (%s) - baglanti "
+                              "korunuyor", getattr(msg, "topic", "?"))
 
         def on_disconnect(*a):
             LOG.warning("MQTT baglantisi koptu, yeniden denenecek")

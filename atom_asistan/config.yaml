@@ -1,5 +1,5 @@
 name: Atom Asistan Bridge
-version: "1.20.0"
+version: "1.20.1"
 slug: atom_asistan
 description: AtomS3R sesli asistan koprusu - OpenAI Realtime + Home Assistant kontrolu
 arch:
