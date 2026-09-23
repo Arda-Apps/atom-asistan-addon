@@ -1,5 +1,5 @@
 name: Atom Asistan Bridge
-version: "1.20.2"
+version: "1.21.3"
 slug: atom_asistan
 description: AtomS3R sesli asistan koprusu - OpenAI Realtime + Home Assistant kontrolu
 arch:
@@ -100,6 +100,14 @@ options:
   gecmis_enabled: true
   # Kac gun saklansin (0 = sinirsiz)
   gecmis_gun_sayisi: 30
+  # --- Kamera ---------------------------------------------------------
+  # Yalnizca kamerasi olan cihazda ac (StackChan Core). AtomS3R'da
+  # kamera yok; acik birakmak modele yapamayacagi bir sey vaat eder,
+  # "bak" cagirir ve bos doner.
+  kamera_enabled: false
+  # Kare gelmezse kac saniye sonra vazgecilsin. Cekim ~0.5 sn suruyor,
+  # ustune ag gecikmesi biniyor; 6 rahat bir pay birakiyor.
+  kamera_bekleme_sn: 6
   # --- Mutlak saatli hatirlaticilar -----------------------------------
   # "yarin 9'da", "her sabah 8'de". Geri sayim zamanlayicisindan ayri.
   hatirlatici_enabled: true
@@ -212,6 +220,8 @@ schema:
   imu_ters_dnd: bool
   gecmis_enabled: bool
   gecmis_gun_sayisi: int(0,365)
+  kamera_enabled: bool?
+  kamera_bekleme_sn: int(2,30)?
   hatirlatici_enabled: bool
   hatirlatici_gecikme_dk: int(1,1440)
   ortam_enabled: bool

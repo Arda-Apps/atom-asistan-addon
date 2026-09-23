@@ -29,7 +29,7 @@ import websockets
 from aiohttp import ClientSession, ClientTimeout
 
 LOG = logging.getLogger("atom")
-BRIDGE_VERSION = "1.20.2"
+BRIDGE_VERSION = "1.21.3"
 
 # Koprunun kullandigi ekran ozellikleri icin gereken EN DUSUK firmware.
 # Kopru firmware'den daha sik guncelleniyor; surumlerin birebir esit olmasi
@@ -320,6 +320,15 @@ FIYAT = {
 }
 
 DEVICE_RATE = 16000          # AtomS3R I2S hizi
+# Elle uyandirmada (buton, el, tik, kisayol) uyandirma anindan ONCE ne kadar
+# ses gonderilsin: 15 parca = 300 ms. Kullanici tam uyandirirken konusmaya
+# basladiysa ilk hece kaybolmasin diye; fazlasi oda gurultusu.
+ELLE_UYANMA_ONCESI_PARCA = 15
+UYANMA_KAYNAK_ADI = {
+    "buton": "buton (uzun basma)",
+    "el": "el sallama (kamera)",
+    "tik": "IMU cift tik",
+}
 OAI_RATE = 24000             # OpenAI Realtime PCM hizi
 
 DEFAULT_INSTRUCTIONS = """\
@@ -820,6 +829,33 @@ TOOLS = [
 ]
 
 
+# Kamerasi olan cihazda ekleniyor (StackChan Core). AtomS3R'da kamera yok,
+# araci tanitmak modele yapamayacagi bir sey vaat etmek olurdu.
+KAMERA_TOOLS = [
+    {
+        "type": "function",
+        "name": "bak",
+        "description": (
+            "Cihazin kamerasindan ANLIK bir foto cekip gorur. Kullanici sana "
+            "bir sey GOSTERDIGINDE ya da 'buna bak', 'bu ne', 'bunu okur "
+            "musun', 'elimde ne var', 'sunun uzerinde ne yaziyor' gibi "
+            "gormeni gerektiren bir sey soyledigi anda cagir. Kamera "
+            "kullaniciya bakiyor ve yakin mesafeyi goruyor. "
+            "Gorsel gelene kadar bir iki saniye gecer; cagirdiktan sonra "
+            "gorseli bekle ve ona bakarak cevap ver."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "neden": {
+                    "type": "string",
+                    "description": "Neye bakiyorsun - kisa not, loga yazilir.",
+                },
+            },
+        },
+    },
+]
+
+
 MEMORY_TOOLS = [
     {
         "type": "function",
@@ -1105,6 +1141,19 @@ class Bridge:
         self.speaking = False
         self._lvl_sum = 0.0          # mikrofon seviyesi olcumu
         self._lvl_n = 0
+        # Akis hizi: cihaz gercek zamanda ses veriyor mu. StackChan'de
+        # 1.21.0 sesin %17'sini kaybediyordu ve tek belirtisi seviye
+        # satirlarinin 3.0 yerine 3.6 sn arayla gelmesiydi - kimse fark
+        # etmedi. Artik oran satira yaziliyor.
+        self._lvl_t0 = None          # pencere basi (monotonic)
+        self._lvl_son = None         # son parcanin geldigi an
+        self._lvl_aralik = 0         # penceredeki parca araligi sayisi
+        self._lvl_kesik = False      # pencerede uzun bosluk (hoparlor calarken cihaz susuyor)
+        # Elle uyandirmada (buton, el, tik, kisayol) tampondan ne kadar
+        # gonderilecegini bilmek icin: tampona giren parca sayaci ve
+        # uyandirma anindaki degeri.
+        self._prebuf_sayac = 0
+        self._uyanma_isareti = None
         # --- yerel konusma algilama (VAD) durumu ---
         self._noise = 400.0          # gurultu tabani tahmini
         self._in_speech = False
@@ -1163,6 +1212,13 @@ class Bridge:
         self.gecmis_on = bool(cfg.get("gecmis_enabled", True))
         self.gecmis_gun = max(0, int(cfg.get("gecmis_gun_sayisi", 30) or 0))
         self.gecmis_dizin = os.path.join(self.state_dir, "gecmis")
+        # Kamera (StackChan Core'da var, AtomS3R'da yok). Kapaliyken "bak"
+        # araci modele hic tanitilmiyor: yapamayacagi bir sey vaat etmek,
+        # cagirip bos donmesinden kotu.
+        self.kamera_on = bool(cfg.get("kamera_enabled", False))
+        self.kamera_bekleme = max(2.0, float(cfg.get("kamera_bekleme_sn", 6) or 6))
+        self._kare_olay: asyncio.Event | None = None
+        self._kare_jpeg: bytes | None = None
         # IMU jestleri (firmware algiliyor, karari kopru veriyor)
         self.imu_ters_dnd = bool(cfg.get("imu_ters_dnd", True))
         self._timer_yukle()
@@ -1276,6 +1332,15 @@ class Bridge:
             self.tools += HATIRLATICI_TOOLS
         if self.gecmis_on:
             self.tools += GECMIS_TOOLS
+        # Kamera araci acik mi - acilista yaz. Kapaliyken model "bu ne?"
+        # sorusuna kamerayi hic kullanmadan "goremiyorum" diyor ve logda
+        # tek iz yok; neden calismadigi ancak ayarlara bakinca anlasiliyor.
+        if self.kamera_on:
+            self.tools += KAMERA_TOOLS
+            LOG.info("Kamera araci (bak) ACIK - 'bu ne?' denince cihazdan foto istenir")
+        else:
+            LOG.info("Kamera araci (bak) KAPALI - acmak icin eklenti ayarlarinda "
+                     "kamera_enabled: true")
         if self.pc_show and self.pc_topic:
             self.tools.append(SHOW_ON_PC_TOOL)
             if self.pc_transport == "atom_desk":
@@ -1401,16 +1466,53 @@ class Bridge:
                             "atom_asistan.ino'yu yeniden flashla.",
                             fw, MIN_FIRMWARE, BRIDGE_VERSION,
                             ", ".join(eksik) if eksik else "(liste bos)")
+        elif t == "kare":
+            # Cihaz kamera karesi gonderdi (base64 JPEG). Iki yoldan
+            # gelebilir: modelin "bak" araci istedi, ya da kullanici ekrana
+            # dokundu. Ikisi de ayni yere dusuyor.
+            import base64 as _b64
+            try:
+                ham = _b64.b64decode(d.get("b64") or "", validate=True)
+            except Exception as e:
+                LOG.warning("Kamera karesi cozulemedi: %s", e)
+                return
+            if not ham:
+                return
+            self._kare_jpeg = ham
+            LOG.info("Kamera karesi alindi: %d bayt (sebep: %s)",
+                     len(ham), d.get("sebep") or "?")
+            if self._kare_olay is not None:
+                # "bak" bunu bekliyor; uyandir.
+                self._kare_olay.set()
+            else:
+                # Kimse beklemiyordu - kullanici ekrana dokundu demektir.
+                # Gorseli konusmaya koyup modelden yorum istiyoruz, yoksa
+                # dokunma hicbir sey yapmamis gibi gorunur.
+                asyncio.create_task(self._kare_kendiliginden(ham))
+            return
+        elif t == "interrupt":
+            # Avuc kamerayi kapatti: konusmayi kes. Cihaz kendi tamponunu
+            # zaten bosaltti ama asil is burada - OpenAI'ye uretmeyi
+            # birak demezsek ses akmaya devam eder.
+            LOG.info("El hareketi: konusma kesiliyor")
+            asyncio.create_task(self._yaniti_kes("el"))
+            return
         elif t == "wake":
             # Firmware 1.8.0+: butona UZUN basinca geliyor (kisa basma artik
             # DND'yi ac/kapat yapiyor). Elle uyandirma wake word varken
             # nadiren gerekiyor, o yuzden zor olan harekete tasindi.
             # DND ve hipnoz kapatma isini _uyandir yapiyor; burada ayrica
             # create_task acmak siralamayi bozuyordu.
-            LOG.info("Butonla uyandirildi (uzun basma)")
+            #
+            # Firmware 1.21.1+ "kaynak" da yolluyor. Eskiden her uyandirma
+            # "Butonla uyandirildi" diye yaziliyordu; StackChan'de fiziksel
+            # buton yok, yani o satirlar el sallama ya da IMU tikiydi ve
+            # yanlis tetiklemenin nereden geldigi logdan anlasilmiyordu.
+            kaynak = str(d.get("kaynak") or "buton")
+            LOG.info("Cihazdan uyandirma: %s", UYANMA_KAYNAK_ADI.get(kaynak, kaynak))
             if not self._turn_starting:
                 self._turn_starting = True
-                asyncio.create_task(self._buton_uyandir())
+                asyncio.create_task(self._uyandir(kaynak))
         elif t == "dnd_toggle":
             # Firmware 1.8.0+: butona KISA basinca geliyor.
             if self.hypno_aktif():
@@ -2125,15 +2227,39 @@ class Bridge:
             self._noise = float(np.percentile(np.array(self._lvl_hist), 20))
         return lvl
 
-    def _log_level(self, lvl: float):
-        """Her ~3 saniyede bir mikrofon seviyesini loglar (teshis)."""
+    def _log_level(self, lvl: float, now: Optional[float] = None):
+        """Her ~3 saniyede bir mikrofon seviyesini loglar (teshis).
+
+        "akis" = cihazin gercek zamana gore ne kadar ses verdigi. 150 parca
+        x 20 ms = 3.0 sn; %100 olmali. Pencerede 300 ms'den uzun bosluk
+        varsa (hoparlor calarken cihaz mikrofonu akitmiyor) oran anlamsiz,
+        "-" yaziliyor.
+        """
+        if now is None:
+            now = time.monotonic()
+        if self._lvl_t0 is None:
+            self._lvl_t0 = now
+        else:
+            self._lvl_aralik += 1
+            if self._lvl_son is not None and now - self._lvl_son > 0.3:
+                self._lvl_kesik = True
+        self._lvl_son = now
         self._lvl_sum += lvl
         self._lvl_n += 1
         if self._lvl_n >= 150:
-            LOG.info("Mikrofon seviyesi: %.0f  (gurultu tabani %.0f, esik %.0f)",
-                     self._lvl_sum / self._lvl_n, self._noise, self._threshold())
+            sure = now - self._lvl_t0
+            if self._lvl_kesik or sure <= 0 or not self._lvl_aralik:
+                akis = "-"
+            else:
+                akis = "%%%d" % round(100.0 * self._lvl_aralik * 0.020 / sure)
+            LOG.info("Mikrofon seviyesi: %.0f  (gurultu tabani %.0f, esik %.0f, akis %s)",
+                     self._lvl_sum / self._lvl_n, self._noise, self._threshold(),
+                     akis)
             self._lvl_sum = 0.0
             self._lvl_n = 0
+            self._lvl_t0 = now
+            self._lvl_aralik = 0
+            self._lvl_kesik = False
 
     async def _vad_step(self, pcm: bytes, lvl: float):
         """20 ms'lik parcaya bakarak konusma basladi/bitti kararini verir."""
@@ -2234,6 +2360,7 @@ class Bridge:
         lvl = self._track_noise(pcm)
         self._log_level(lvl)
         self._prebuf.append(pcm)          # her zaman doluyor, geriye donuk kayit
+        self._prebuf_sayac += 1
 
         # Oturum kuruluyorsa sesi sadece tampona al ve DON. start_turn'u
         # burada await edersek "async for msg in ws" dongusu duruyor,
@@ -2933,10 +3060,10 @@ class Bridge:
             await self.dnd_ayarla(False, kaynak=kaynak)
         if self.hypno_aktif():
             await self.hypno_ayarla(False, kaynak=kaynak)
+        # Elle uyandirma: tampondan yalnizca bu andan sonrasi (+ kisa bir
+        # pay) gidecek. Isaret burada, oturum acilmadan ONCE konuyor.
+        self._uyanma_isareti = self._prebuf_sayac
         await self._start_turn_bg(kaynak)
-
-    async def _buton_uyandir(self):
-        await self._uyandir("buton")
 
     async def uzaktan_uyandir(self, kaynak: str = "kisayol"):
         """MQTT'den gelen uyandirma. Cihaz yoksa bosuna oturum acmiyoruz."""
@@ -2954,7 +3081,7 @@ class Bridge:
         """start_turn'u cihaz okuma dongusunun DISINDA calistirir."""
         t0 = time.time()
         try:
-            await self.start_turn()
+            await self.start_turn(kaynak)
         except Exception as e:
             metin = str(e)
             if "401" in metin or "403" in metin or "invalid_api_key" in metin.lower():
@@ -2973,7 +3100,7 @@ class Bridge:
             self._turn_starting = False
             LOG.info("Tur hazir (%s) - %d ms", kaynak, int((time.time() - t0) * 1000))
 
-    async def start_turn(self):
+    async def start_turn(self, kaynak: str = "wake word"):
         # DIKKAT: once tazele, sonra oturum ac. ensure_openai icinde self.oai
         # atandigi anda idle_watchdog bu turu gecerli sayiyor; last_activity
         # hala onceki oturumdan kalma eski deger olursa watchdog daha
@@ -2996,13 +3123,119 @@ class Bridge:
         # sayac bos ya da gecmiste kalirsa oturumu daha dogmadan olduruyor.
         self._sleep_at = time.time() + max(self.follow_up_window, 8.0)
         self.up = Resampler(DEVICE_RATE, OAI_RATE)
-        await self._flush_prebuffer()
+        # Wake word'de tamponun tamami gidiyor: "Hey Jarvis" ve hemen
+        # ardindan soylenenler orada (AtomS3R'da boyle calisiyor, dokunmadik).
+        # ELLE uyandirmada ise uyandirma anindan onceki saniyeler kullanici
+        # konusmaya niyet etmeden onceki ODA GURULTUSU. 3 sn gurultu gonderince
+        # model onu yorumlamaya calisiyor: "Thanks for watching, please don't
+        # forget to like..." (bilinen bir transkripsiyon hayali) ve ardindan
+        # alakasiz bir cevap. Oturum acilirken (~1 sn) gelen ses yine
+        # gidiyor; sadece oncesi kirpiliyor.
+        if kaynak != "wake word" and self._uyanma_isareti is not None:
+            sonra = max(0, self._prebuf_sayac - self._uyanma_isareti)
+            await self._flush_prebuffer(sonra + ELLE_UYANMA_ONCESI_PARCA)
+        else:
+            await self._flush_prebuffer()
+        self._uyanma_isareti = None
         # Wake word sesi zaten tampondan gonderildi. Turu zorla "konusuluyor"
         # saymiyoruz: ortam gurultusu esigin uzerindeyse tur hic kapanmiyordu.
         # Kullanici devam ederse VAD kendisi yakalar; hic konusmazsa asagidaki
         # sayac cihazi uykuya dondurur.
         self._sleep_at = time.time() + max(self.follow_up_window, 8.0)
         await self.set_state("listening")
+
+    async def _yaniti_kes(self, kaynak: str):
+        """Uretilmekte olan yaniti durdurur ve cihazin tamponunu bosaltir.
+
+        UC YERI birden susturmak gerekiyor, biri eksik kalirsa ses devam
+        eder: (1) OpenAI uretmeye devam ediyor, (2) sunucunun cikis
+        tamponunda bekleyen ses var, (3) cihazin kendi halka tamponu
+        dolu. Cihaz ucuncusunu kendisi yapiyor ama biz de soyluyoruz -
+        kesme baska bir yerden (ornegin HA) gelirse cihaz haberdar olmaz.
+        """
+        if not self._response_active:
+            LOG.info("Kesme istendi (%s) ama uretilen yanit yok", kaynak)
+            return
+        try:
+            await self.oai.send(json.dumps({"type": "response.cancel"}))
+            # Sunucuda kuyruga girmis sesi de at; sadece cancel demek
+            # birikmis parcalarin calmasini engellemiyor.
+            await self.oai.send(json.dumps({"type": "output_audio_buffer.clear"}))
+        except Exception as e:
+            LOG.warning("Yanit kesilemedi (%s): %s", kaynak, e)
+            return
+        self._response_active = False
+        await self.send_device_text({"type": "clear_audio"})
+        await self.set_state("listening")
+        LOG.info("Yanit kesildi (%s)", kaynak)
+
+    async def _kare_kendiliginden(self, jpeg: bytes):
+        """Kullanici ekrana dokundu: gorseli konusmaya koy, yorum iste.
+
+        "bak" araciyla gelen kareden farki, ortada bekleyen bir arac
+        cagrisi olmamasi - modele ayrica "bunu anlat" demek gerekiyor.
+        """
+        if not self.oai:
+            return
+        try:
+            await self._kare_konusmaya_koy(
+                jpeg,
+                "Kullanici cihazin ekranina dokunarak sana bir sey gosterdi. "
+                "Gorseldekini kisaca, tek iki cumleyle anlat.")
+            await self.oai.send(json.dumps({
+                "type": "response.create",
+                "response": {"output_modalities": ["audio"]},
+            }))
+        except Exception as e:
+            LOG.warning("Kendiliginden kare islenemedi: %s", e)
+
+    async def _kare_konusmaya_koy(self, jpeg: bytes, metin: str):
+        """JPEG'i data URL olarak konusmaya ekler."""
+        import base64 as _b64
+        url = "data:image/jpeg;base64," + _b64.b64encode(jpeg).decode("ascii")
+        await self.oai.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": metin},
+                    {"type": "input_image", "image_url": url},
+                ],
+            },
+        }))
+
+    async def kare_iste(self, neden: str = "") -> dict:
+        """Cihazdan kare ister ve gelmesini bekler. "bak" aracinin govdesi."""
+        if not self.kamera_on:
+            return {"error": "kamera kapali"}
+        if self.device is None:
+            return {"error": "cihaz bagli degil"}
+
+        self._kare_jpeg = None
+        self._kare_olay = asyncio.Event()
+        await self.set_state("searching")        # gozler baksin
+        try:
+            await self.send_device_text({"type": "kare_iste"})
+            try:
+                await asyncio.wait_for(self._kare_olay.wait(), self.kamera_bekleme)
+            except asyncio.TimeoutError:
+                return {"error": "kameradan goruntu gelmedi"}
+            jpeg = self._kare_jpeg
+            if not jpeg:
+                return {"error": "bos goruntu"}
+            await self._kare_konusmaya_koy(
+                jpeg,
+                "Cihazin kamerasindan su anki goruntu. Sorulani buna bakarak "
+                "cevapla; goremedigin bir sey varsa 'goremiyorum' de, tahmin "
+                "etme.")
+            LOG.info("Kare modele verildi (%d bayt, neden: %s)",
+                     len(jpeg), neden or "-")
+            return {"ok": True, "bayt": len(jpeg)}
+        finally:
+            # Olayi MUTLAKA temizle: kalirsa sonraki kendiliginden gelen
+            # kare "birisi bekliyor" sanilip konusmaya hic girmez.
+            self._kare_olay = None
 
     async def _flush_prebuffer(self, max_chunks: Optional[int] = None):
         """Oturum acilmadan onceki son saniyeleri modele geriye donuk gonderir."""
@@ -3306,6 +3539,8 @@ class Bridge:
                                                     args.get("data"))
                 if isinstance(result, dict) and result.get("ok"):
                     await self.set_state("success")   # kisa yesil onay
+            elif name == "bak":
+                result = await self.kare_iste(args.get("neden") or "")
             elif name == "ha_get_state":
                 await self.set_state("searching")     # gozler tarama yapsin
                 result = await self.ha.get_state(args.get("entity_id", ""))
