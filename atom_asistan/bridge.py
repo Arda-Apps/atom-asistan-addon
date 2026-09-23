@@ -29,7 +29,7 @@ import websockets
 from aiohttp import ClientSession, ClientTimeout
 
 LOG = logging.getLogger("atom")
-BRIDGE_VERSION = "1.21.3"
+BRIDGE_VERSION = "1.21.4"
 
 # Koprunun kullandigi ekran ozellikleri icin gereken EN DUSUK firmware.
 # Kopru firmware'den daha sik guncelleniyor; surumlerin birebir esit olmasi
@@ -324,6 +324,16 @@ DEVICE_RATE = 16000          # AtomS3R I2S hizi
 # ses gonderilsin: 15 parca = 300 ms. Kullanici tam uyandirirken konusmaya
 # basladiysa ilk hece kaybolmasin diye; fazlasi oda gurultusu.
 ELLE_UYANMA_ONCESI_PARCA = 15
+# Cihaz foto cekmeden once bu kadar sure canli onizleme gosteriyor (nisan).
+# "bak" bekleme suresine eklenir; firmware'deki KAMERA_HAZIRLIK_MS ile ayni.
+KAMERA_HAZIRLIK_SN = 2.0
+# Arac sonucu geldikten sonra modelin KONUSMASI gerekmeyen araclar.
+# Bunlarin disindaki her aractan sonra model sonucu soyleyebilsin diye
+# yeni bir yanit isteniyor (bkz. _arac_devam).
+SESSIZ_ARACLAR = {"set_face", "sleep", "rahatsiz_etme", "hipnoz_modu"}
+# Bir kullanici cumlesine en fazla bu kadar arka arkaya "devam" yaniti.
+# Model her devamda yine arac cagirirsa sonsuz donguye girmesin.
+ARAC_DEVAM_AZAMI = 3
 UYANMA_KAYNAK_ADI = {
     "buton": "buton (uzun basma)",
     "el": "el sallama (kamera)",
@@ -836,13 +846,16 @@ KAMERA_TOOLS = [
         "type": "function",
         "name": "bak",
         "description": (
-            "Cihazin kamerasindan ANLIK bir foto cekip gorur. Kullanici sana "
+            "Cihazin kamerasindan foto cekip gorur. Kullanici sana "
             "bir sey GOSTERDIGINDE ya da 'buna bak', 'bu ne', 'bunu okur "
             "musun', 'elimde ne var', 'sunun uzerinde ne yaziyor' gibi "
             "gormeni gerektiren bir sey soyledigi anda cagir. Kamera "
             "kullaniciya bakiyor ve yakin mesafeyi goruyor. "
-            "Gorsel gelene kadar bir iki saniye gecer; cagirdiktan sonra "
-            "gorseli bekle ve ona bakarak cevap ver."),
+            "Cihaz once 2 saniye canli goruntu gosterir (kullanici cismi "
+            "kadraja oturtsun diye), sonra ceker. Bu yuzden cagirmadan "
+            "HEMEN ONCE cok kisa soyle: 'Kameraya tut, bakiyorum.' "
+            "Gorsel gelince bekletmeden ona bakarak cevap ver. Kucuk yazi "
+            "okunmuyorsa cismi yaklastirmasini iste."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -1165,6 +1178,14 @@ class Bridge:
         self._lvl_hist = collections.deque(maxlen=250)   # son 5 sn seviye
         self._noise_n = 0
         self._response_active = False  # sunucuda su an bir yanit uretiliyor mu
+        # Arac, onu cagiran yanit henuz BITMEDEN sonuclaniyor
+        # (function_call_arguments.done -> sonuc -> response.done). O anda
+        # response.create gonderilemiyor, gonderilmedigi icin de model arac
+        # sonucunu hic soylemiyordu: "bak" goruntuyu aldi ama sustu,
+        # kullanici "eee nedir?" diyene kadar cevap gelmedi. Bayrak
+        # response.done'da okunup yeni yanit isteniyor.
+        self._arac_devam = False
+        self._arac_devam_sayac = 0
         self._proaktif_bekleyen = None  # sesli cikmasini bekledigimiz bildirim
         self._sleep_at = None        # bu ana kadar kimse konusmazsa uyu
         self._sleep_now = False      # model sleep aracini cagirdi
@@ -1219,6 +1240,7 @@ class Bridge:
         self.kamera_bekleme = max(2.0, float(cfg.get("kamera_bekleme_sn", 6) or 6))
         self._kare_olay: asyncio.Event | None = None
         self._kare_jpeg: bytes | None = None
+        self._kare_hata: str | None = None    # cihazin bildirdigi cekim hatasi
         # IMU jestleri (firmware algiliyor, karari kopru veriyor)
         self.imu_ters_dnd = bool(cfg.get("imu_ters_dnd", True))
         self._timer_yukle()
@@ -1489,6 +1511,14 @@ class Bridge:
                 # Gorseli konusmaya koyup modelden yorum istiyoruz, yoksa
                 # dokunma hicbir sey yapmamis gibi gorunur.
                 asyncio.create_task(self._kare_kendiliginden(ham))
+            return
+        elif t == "kare_hata":
+            # Cihaz cekemedi ve nedenini soyledi (firmware 1.21.4+). Bekleyen
+            # "bak" varsa hemen uyandir; 15 sn zaman asimini beklemesin.
+            self._kare_hata = str(d.get("neden") or "bilinmiyor")
+            LOG.warning("Kamera cekemedi: %s", self._kare_hata)
+            if self._kare_olay is not None:
+                self._kare_olay.set()
             return
         elif t == "interrupt":
             # Avuc kamerayi kapatti: konusmayi kes. Cihaz kendi tamponunu
@@ -2346,6 +2376,7 @@ class Bridge:
             return
 
         LOG.info("Konusma bitti (%d ms), yanit isteniyor", spoken)
+        self._arac_devam_sayac = 0
         self.last_activity = time.time()
         await self.set_state("thinking")
         try:
@@ -3118,6 +3149,8 @@ class Bridge:
                 pass
         self._reset_vad()
         self._out_carry = b""
+        self._arac_devam = False             # onceki oturumdan kalmasin
+        self._arac_devam_sayac = 0
         # Sayaci ONCE ileri at. _flush_prebuffer 250 parcayi tek tek
         # gonderdigi icin ~400 ms suruyor ve o sirada watchdog calisiyor;
         # sayac bos ya da gecmiste kalirsa oturumu daha dogmadan olduruyor.
@@ -3213,22 +3246,28 @@ class Bridge:
             return {"error": "cihaz bagli degil"}
 
         self._kare_jpeg = None
+        self._kare_hata = None
         self._kare_olay = asyncio.Event()
         await self.set_state("searching")        # gozler baksin
         try:
             await self.send_device_text({"type": "kare_iste"})
             try:
-                await asyncio.wait_for(self._kare_olay.wait(), self.kamera_bekleme)
+                # Cihaz once KAMERA_HAZIRLIK_SN canli onizleme gosteriyor.
+                await asyncio.wait_for(self._kare_olay.wait(),
+                                       self.kamera_bekleme + KAMERA_HAZIRLIK_SN)
             except asyncio.TimeoutError:
-                return {"error": "kameradan goruntu gelmedi"}
+                return {"error": "kameradan goruntu gelmedi (cihaz cevap vermedi)"}
+            if self._kare_hata:
+                return {"error": "kamera cekemedi: " + self._kare_hata}
             jpeg = self._kare_jpeg
             if not jpeg:
                 return {"error": "bos goruntu"}
             await self._kare_konusmaya_koy(
                 jpeg,
-                "Cihazin kamerasindan su anki goruntu. Sorulani buna bakarak "
-                "cevapla; goremedigin bir sey varsa 'goremiyorum' de, tahmin "
-                "etme.")
+                "Cihazin kamerasindan su anki goruntu. Sorulani SIMDI buna "
+                "bakarak cevapla, kullanicinin tekrar sormasini bekleme. "
+                "Goremedigin ya da okuyamadigin bir sey varsa acikca soyle, "
+                "tahmin etme.")
             LOG.info("Kare modele verildi (%d bayt, neden: %s)",
                      len(jpeg), neden or "-")
             return {"ok": True, "bayt": len(jpeg)}
@@ -3427,6 +3466,18 @@ class Bridge:
             self.speaking = False
             self.last_activity = time.time()
             self._reset_vad()
+            if self._arac_devam and self.oai is not None and not self._sleep_now:
+                self._arac_devam = False
+                self._arac_devam_sayac += 1
+                if self._arac_devam_sayac <= ARAC_DEVAM_AZAMI:
+                    LOG.info("Arac sonucu icin yanit isteniyor (%d)",
+                             self._arac_devam_sayac)
+                    await self.oai.send(json.dumps({"type": "response.create"}))
+                    await self.set_state("thinking")
+                    return
+                LOG.warning("Arka arkaya %d arac devami - durduruldu",
+                            self._arac_devam_sayac - 1)
+            self._arac_devam = False
             if self._sleep_now:
                 self._sleep_now = False
                 # Veda cumlesinin sesi cihazda bitsin diye kisa bekleme.
@@ -3664,8 +3715,13 @@ class Bridge:
                      "call_id": call_id,
                      "output": json.dumps(result, ensure_ascii=False)},
         }))
+        if name in SESSIZ_ARACLAR:
+            return
         if not self._response_active:
             await self.oai.send(json.dumps({"type": "response.create"}))
+        else:
+            # Cagiran yanit hala acik; bitince (response.done) devam ettir.
+            self._arac_devam = True
 
 
 
